@@ -2,125 +2,175 @@
 #include <WebSocketsServer.h>
 #include <ArduinoJson.h>
 #include <Wire.h>
-#include <Adafruit_BMP085.h>
-#include <MPU6050.h>
-#include <TinyGPS++.h>
+#include <Adafruit_BMP085_U.h>
+#include <Adafruit_MPU6050.h>
 #include <DFRobotDFPlayerMini.h>
-#include <HardwareSerial.h>
 
+// ====== WiFi Config ======
 const char* ssid = "YourWiFiSSID";
 const char* password = "YourWiFiPassword";
 
+// ====== WebSocket ======
 WebSocketsServer webSocket = WebSocketsServer(8765);
 
-// BMP180 & MPU6050 (I2C)
-Adafruit_BMP085 bmp;
-MPU6050 mpu;
+// ====== Sensors ======
+Adafruit_BMP085_Unified bmp = Adafruit_BMP085_Unified(10085);
+Adafruit_MPU6050 mpu;
 
-// GPS UART1
+// ====== GPS (UART1) ======
 HardwareSerial GPS(1);
-TinyGPSPlus gps;
 
-// MP3 Player UART2
+// ====== DFPlayer Mini (UART2) ======
 HardwareSerial MP3(2);
 DFRobotDFPlayerMini player;
 
-// Pins
-const int heartRatePin = 36;
-const int squeezePin = 27;
-const int ledPin = 13;
+// ====== Pins ======
+#define HEART_SENSOR_PIN 34
+#define LED_PIN 13
+
+// ====== Heart Rate Detection ======
+int threshold = 350;
+int sensorValue = 0;
+unsigned long lastBeatTime = 0;
+unsigned long beatCooldown = 500;
+int bpm = 0;
+bool beatDetected = false;
+
+// ====== Timers ======
+unsigned long lastSend = 0;
+unsigned long dfplayerTimer = 0;
+
+// ====== WebSocket Event Declaration ======
+void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length);
+
+String latestGPS = "";
 
 void setup() {
   Serial.begin(115200);
-  
-  // Connect to WiFi
+  pinMode(HEART_SENSOR_PIN, INPUT);
+  pinMode(LED_PIN, OUTPUT);
+
+  // WiFi
   WiFi.begin(ssid, password);
+  Serial.print("Connecting to WiFi");
   while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
+    delay(500); Serial.print(".");
   }
-  Serial.println("WiFi connected");
-  Serial.println("IP address: ");
+  Serial.println("\nWiFi connected.");
   Serial.println(WiFi.localIP());
 
-  // Start WebSocket server
+  // WebSocket
   webSocket.begin();
   webSocket.onEvent(webSocketEvent);
 
-  // Initialize sensors
+  // I2C Init
   Wire.begin(21, 22);
-  
+
+  // BMP180
   if (!bmp.begin()) {
     Serial.println("BMP180 not found!");
   }
-  
-  mpu.initialize();
-  if (!mpu.testConnection()) {
-    Serial.println("MPU6050 connection failed!");
+
+  // MPU6050
+  if (!mpu.begin()) {
+    Serial.println("MPU6050 not found!");
+  } else {
+    mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
+    mpu.setGyroRange(MPU6050_RANGE_500_DEG);
+    mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
   }
-  
+
+  // GPS UART1 (GPIO 17 TX, 16 RX)
   GPS.begin(9600, SERIAL_8N1, 17, 16);
+
+  // DFPlayer Mini UART2 (GPIO 25 TX, 26 RX)
   MP3.begin(9600, SERIAL_8N1, 25, 26);
-  
   if (player.begin(MP3)) {
     player.volume(25);
+    player.play(2);  // Welcome sound
+    dfplayerTimer = millis();
+  } else {
+    Serial.println("DFPlayer failed to start.");
   }
-  
-  pinMode(heartRatePin, INPUT);
-  pinMode(squeezePin, INPUT_PULLUP);
-  pinMode(ledPin, OUTPUT);
 }
 
 void loop() {
   webSocket.loop();
-  
-  // Read sensor data
-  float temperature = bmp.readTemperature();
-  int heartRate = readHeartRate();
-  double lat = gps.location.lat();
-  double lng = gps.location.lng();
-  
-  // Create JSON object
-  StaticJsonDocument<200> doc;
-  doc["temperature"] = temperature;
-  doc["heartRate"] = heartRate;
-  doc["location"]["lat"] = lat;
-  doc["location"]["lng"] = lng;
-  
-  // Convert to string
-  String jsonString;
-  serializeJson(doc, jsonString);
-  
-  // Send to all connected clients
-  webSocket.broadcastTXT(jsonString);
-  
-  // Update GPS data
+
+  // Heart Rate Sensor
+  sensorValue = analogRead(HEART_SENSOR_PIN);
+  unsigned long currentTime = millis();
+  if (sensorValue > threshold && !beatDetected && currentTime - lastBeatTime > beatCooldown) {
+    bpm = 60000 / (currentTime - lastBeatTime);
+    lastBeatTime = currentTime;
+    beatDetected = true;
+  } else if (sensorValue < threshold) {
+    beatDetected = false;
+  }
+
+  // BMP180 Readings
+  sensors_event_t bmp_event;
+  float temperature = 0, pressure = 0, altitude = 0;
+  bmp.getEvent(&bmp_event);
+  if (bmp_event.pressure) {
+    bmp.getTemperature(&temperature);
+    pressure = bmp_event.pressure;
+    altitude = bmp.pressureToAltitude(1013.25, pressure);
+  }
+
+  // MPU6050 Readings
+  sensors_event_t a, g, temp;
+  mpu.getEvent(&a, &g, &temp);
+
+  // Read raw GPS NMEA sentence
   while (GPS.available()) {
-    gps.encode(GPS.read());
+    char c = GPS.read();
+    if (c == '$') latestGPS = ""; // new sentence
+    latestGPS += c;
   }
-  
-  delay(1000);
+
+  // DFPlayer track rotation
+  if (millis() - dfplayerTimer > 9000) {
+    dfplayerTimer = millis();
+    player.next();
+  }
+
+  // Send JSON via WebSocket
+  if (millis() - lastSend > 1000) {
+    lastSend = millis();
+
+    StaticJsonDocument<512> doc;
+    doc["bpm"] = bpm;
+    doc["temperature"] = temperature;
+    doc["pressure"] = pressure;
+    doc["altitude"] = altitude;
+
+    JsonArray accel = doc.createNestedArray("accel");
+    accel.add(a.acceleration.x);
+    accel.add(a.acceleration.y);
+    accel.add(a.acceleration.z);
+
+    JsonArray gyro = doc.createNestedArray("gyro");
+    gyro.add(g.gyro.x);
+    gyro.add(g.gyro.y);
+    gyro.add(g.gyro.z);
+
+    doc["mpuTemp"] = temp.temperature;
+
+    // Send raw GPS sentence (parse on frontend or later in firmware)
+    doc["gpsRaw"] = latestGPS;
+
+    String output;
+    serializeJson(doc, output);
+    webSocket.broadcastTXT(output);
+  }
+
+  delay(50);
 }
 
-int readHeartRate() {
-  static int readings[10];
-  static int idx = 0;
-  
-  readings[idx] = analogRead(heartRatePin);
-  idx = (idx + 1) % 10;
-  
-  int avg = 0;
-  for (int i = 0; i < 10; i++) {
-    avg += readings[i];
-  }
-  avg /= 10;
-  
-  // Convert analog reading to BPM (simplified)
-  return map(avg, 0, 4095, 60, 100);
-}
-
+// WebSocket Event Handler
 void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length) {
-  switch(type) {
+  switch (type) {
     case WStype_DISCONNECTED:
       Serial.printf("[%u] Disconnected!\n", num);
       break;
@@ -128,7 +178,7 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length
       Serial.printf("[%u] Connected!\n", num);
       break;
     case WStype_TEXT:
-      // Handle incoming messages if needed
+      Serial.printf("[%u] Message: %s\n", num, payload);
       break;
   }
 }
